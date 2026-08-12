@@ -51,9 +51,33 @@ x86-64, 16 cores), training the same model for the same 3600 epochs:
 | startup (`import tensorflow`) | 3.0s       | -        |
 | write `.tflite`        | 0.53s             | ~1ms     |
 
-Keras spends ~29ms of fixed dispatch overhead per train step, which dwarfs
-the actual math of a 772-parameter model; the Go loop runs the same batch in
-~130µs.
+### Why is tf.keras 200x slower here?
+
+It is not Python itself — it is per-step fixed overhead in the framework.
+Measuring the cost of one optimizer step (one batch) at each layer:
+
+| how the same step runs        | ms/step | 3600 epochs |
+|-------------------------------|---------|-------------|
+| `model.fit`                   | 28.2    | 203s        |
+| `train_on_batch`              | 3.3     | 24s         |
+| raw `tf.function` train step  | 2.6     | 18.5s       |
+| same math in plain numpy      | 0.25    | 1.8s        |
+| this Go loop                  | 0.13    | 0.95s       |
+
+* **~25ms/step is `fit` machinery**: per-epoch data-adapter/iterator setup,
+  the callback chain and metric bookkeeping. This dataset is 2 batches per
+  epoch, so ~50ms of per-epoch setup lands on 2 steps — many tiny epochs is
+  `fit`'s worst case.
+* **~2.6ms/step is the TF executor**: a step is a graph of dozens of tiny
+  kernels, each paying dispatch and inter-op thread-pool handoffs. With 7x64
+  matrices nothing amortizes; TF's fixed costs are designed to disappear
+  behind big kernels (large batches, GPU), and here they never do.
+* **numpy is within 2x of Go**, which shows the actual math of a
+  772-parameter model is negligible.
+
+XNNPACK only accelerates TFLite *inference*; it plays no part in training,
+which is why inference is fast in both worlds while training speed differs
+by 200x.
 
 ## Requirements
 
