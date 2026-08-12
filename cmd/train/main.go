@@ -8,6 +8,9 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"runtime"
+	"sync/atomic"
+	"time"
 
 	flatbuffers "github.com/google/flatbuffers/go"
 )
@@ -71,40 +74,8 @@ func newDense(in, out int, r *rand.Rand) *dense {
 	return d
 }
 
-func (d *dense) forward(x [][]float64) [][]float64 {
-	y := make([][]float64, len(x))
-	for n, xi := range x {
-		yi := make([]float64, d.out)
-		copy(yi, d.b)
-		for i, v := range xi {
-			if v == 0 {
-				continue
-			}
-			for j, w := range d.w[i*d.out : (i+1)*d.out] {
-				yi[j] += v * w
-			}
-		}
-		y[n] = yi
-	}
-	return y
-}
-
-func (d *dense) update(x, dy [][]float64, t int) {
-	gw := make([]float64, len(d.w))
-	gb := make([]float64, len(d.b))
-	for n, dyi := range dy {
-		for i, v := range x[n] {
-			if v == 0 {
-				continue
-			}
-			for j, g := range dyi {
-				gw[i*d.out+j] += v * g
-			}
-		}
-		for j, g := range dyi {
-			gb[j] += g
-		}
-	}
+// apply performs one Adam update from accumulated gradients.
+func (d *dense) apply(gw, gb []float64, t int) {
 	c1 := 1 - math.Pow(beta1, float64(t))
 	c2 := 1 - math.Pow(beta2, float64(t))
 	adam := func(w, m, v, g []float64) {
@@ -118,39 +89,118 @@ func (d *dense) update(x, dy [][]float64, t int) {
 	adam(d.b, d.mb, d.vb, gb)
 }
 
-func tanhAll(x [][]float64) [][]float64 {
-	y := make([][]float64, len(x))
-	for n, xi := range x {
-		yi := make([]float64, len(xi))
-		for i, v := range xi {
-			yi[i] = math.Tanh(v)
-		}
-		y[n] = yi
-	}
-	return y
+// grad holds per-batch gradient accumulators, allocated once.
+type grad struct {
+	w1, b1, w2, b2 []float64
 }
 
-func softmaxAll(x [][]float64) [][]float64 {
-	y := make([][]float64, len(x))
-	for n, xi := range x {
-		yi := make([]float64, len(xi))
-		max := xi[0]
-		for _, v := range xi[1:] {
-			if v > max {
-				max = v
-			}
-		}
-		var sum float64
-		for i, v := range xi {
-			yi[i] = math.Exp(v - max)
-			sum += yi[i]
-		}
-		for i := range yi {
-			yi[i] /= sum
-		}
-		y[n] = yi
+func newGrad() *grad {
+	return &grad{
+		w1: make([]float64, numDigits*hidden),
+		b1: make([]float64, hidden),
+		w2: make([]float64, hidden*classes),
+		// padded to a full cache line: workers write b2 on every sample, and
+		// 32-byte allocations from different workers can share a line
+		b2: make([]float64, 8)[:classes],
 	}
-	return y
+}
+
+func (g *grad) reset() {
+	clear(g.w1)
+	clear(g.b1)
+	clear(g.w2)
+	clear(g.b2)
+}
+
+func (g *grad) add(o *grad) {
+	for i, v := range o.w1 {
+		g.w1[i] += v
+	}
+	for i, v := range o.b1 {
+		g.b1[i] += v
+	}
+	for i, v := range o.w2 {
+		g.w2[i] += v
+	}
+	for i, v := range o.b2 {
+		g.b2[i] += v
+	}
+}
+
+// forward computes h = tanh(x.W1 + b1) and p = softmax(h.W2 + b2).
+func forward(l1, l2 *dense, x []float64, h *[hidden]float64, p *[classes]float64) {
+	copy(h[:], l1.b)
+	for i, v := range x {
+		if v == 0 {
+			continue
+		}
+		w := l1.w[i*hidden : (i+1)*hidden]
+		for j := range h {
+			h[j] += v * w[j]
+		}
+	}
+	for j := range h {
+		h[j] = math.Tanh(h[j])
+	}
+
+	copy(p[:], l2.b)
+	for j := range h {
+		w := l2.w[j*classes : (j+1)*classes]
+		for k := range p {
+			p[k] += h[j] * w[k]
+		}
+	}
+	max := p[0]
+	for _, v := range p[1:] {
+		if v > max {
+			max = v
+		}
+	}
+	var sum float64
+	for k := range p {
+		p[k] = math.Exp(p[k] - max)
+		sum += p[k]
+	}
+	for k := range p {
+		p[k] /= sum
+	}
+}
+
+// step runs forward + backward for one sample and accumulates gradients.
+func step(l1, l2 *dense, x, y []float64, invN float64, g *grad) {
+	var h [hidden]float64
+	var p [classes]float64
+	forward(l1, l2, x, &h, &p)
+
+	// categorical crossentropy + softmax: dz2 = (p - y) / n
+	var d2 [classes]float64
+	for k := range d2 {
+		d2[k] = (p[k] - y[k]) * invN
+		g.b2[k] += d2[k]
+	}
+
+	// gw2 += h x d2, dz1 = (dz2 . W2^T) * (1 - h^2)
+	var d1 [hidden]float64
+	for j := range h {
+		w := l2.w[j*classes : (j+1)*classes]
+		gw := g.w2[j*classes : (j+1)*classes]
+		var dh float64
+		for k, d := range d2 {
+			gw[k] += h[j] * d
+			dh += w[k] * d
+		}
+		d1[j] = dh * (1 - h[j]*h[j])
+		g.b1[j] += d1[j]
+	}
+	for i, v := range x {
+		if v == 0 {
+			continue
+		}
+		gw := g.w1[i*hidden : (i+1)*hidden]
+		for j := range d1 {
+			gw[j] += v * d1[j]
+		}
+	}
 }
 
 func argmax(v []float64) int {
@@ -163,15 +213,13 @@ func argmax(v []float64) int {
 	return best
 }
 
-func predict(l1, l2 *dense, x [][]float64) [][]float64 {
-	return softmaxAll(l2.forward(tanhAll(l1.forward(x))))
-}
-
 func evaluate(l1, l2 *dense, x, y [][]float64) (loss, acc float64) {
-	p := predict(l1, l2, x)
-	for n, pi := range p {
-		loss -= math.Log(math.Max(pi[argmax(y[n])], 1e-12))
-		if argmax(pi) == argmax(y[n]) {
+	var h [hidden]float64
+	var p [classes]float64
+	for n := range x {
+		forward(l1, l2, x[n], &h, &p)
+		loss -= math.Log(math.Max(p[argmax(y[n])], 1e-12))
+		if argmax(p[:]) == argmax(y[n]) {
 			acc++
 		}
 	}
@@ -186,9 +234,11 @@ func main() {
 
 	trX := make([][]float64, samples)
 	trY := make([][]float64, samples)
+	idx := make([]int, samples)
 	for i := 1; i <= samples; i++ {
 		trX[i-1] = bin(i, numDigits)
 		trY[i-1] = fizzbuzz(i)
+		idx[i-1] = i - 1
 	}
 
 	l1 := newDense(numDigits, hidden, r)
@@ -197,53 +247,80 @@ func main() {
 		numDigits, hidden, hidden, classes,
 		len(l1.w)+len(l1.b)+len(l2.w)+len(l2.b))
 
+	// Data-parallel workers, each with its own gradient accumulator. A batch
+	// is only ~30µs of work, so sleeping between batches costs more in futex
+	// wake-ups than it saves: persistent workers spin on an atomic sequence
+	// number instead, and the main goroutine processes chunk 0 itself.
+	nw := min(runtime.GOMAXPROCS(0), 4)
+	grads := make([]*grad, nw)
+	for i := range grads {
+		grads[i] = newGrad()
+	}
+	var (
+		ids       []int
+		invN      float64
+		chunk     int
+		seq, done atomic.Uint32
+		quit      atomic.Bool
+	)
+	for w := 1; w < nw; w++ {
+		go func(w int, g *grad) {
+			for last := uint32(0); ; last++ {
+				for spins := 0; seq.Load() == last; spins++ {
+					if quit.Load() {
+						return
+					}
+					if spins > 1000 {
+						// yield so an oversubscribed scheduler can run others
+						runtime.Gosched()
+						spins = 0
+					}
+				}
+				g.reset()
+				lo := w * chunk
+				for _, i := range ids[min(lo, len(ids)):min(lo+chunk, len(ids))] {
+					step(l1, l2, trX[i], trY[i], invN, g)
+				}
+				done.Add(1)
+			}
+		}(w, grads[w])
+	}
+
+	started := time.Now()
 	t := 0
 	for epoch := 1; epoch <= epochs; epoch++ {
-		perm := r.Perm(samples)
-		for start := 0; start < samples; start += batchSize {
-			end := min(start+batchSize, samples)
-			x := make([][]float64, 0, end-start)
-			y := make([][]float64, 0, end-start)
-			for _, i := range perm[start:end] {
-				x = append(x, trX[i])
-				y = append(y, trY[i])
+		r.Shuffle(samples, func(i, j int) { idx[i], idx[j] = idx[j], idx[i] })
+		for lo := 0; lo < samples; lo += batchSize {
+			hi := min(lo+batchSize, samples)
+			ids = idx[lo:hi]
+			invN = 1 / float64(hi-lo)
+			chunk = (hi - lo + nw - 1) / nw
+			done.Store(0)
+			seq.Add(1)
+			grads[0].reset()
+			for _, i := range ids[:min(chunk, len(ids))] {
+				step(l1, l2, trX[i], trY[i], invN, grads[0])
 			}
-
-			h := tanhAll(l1.forward(x))
-			p := softmaxAll(l2.forward(h))
-
-			// categorical crossentropy + softmax: dz2 = (p - y) / n
-			n := float64(len(x))
-			dz2 := make([][]float64, len(x))
-			for i, pi := range p {
-				di := make([]float64, classes)
-				for j := range di {
-					di[j] = (pi[j] - y[i][j]) / n
+			for spins := 0; done.Load() < uint32(nw-1); spins++ {
+				if spins > 1000 {
+					runtime.Gosched()
+					spins = 0
 				}
-				dz2[i] = di
 			}
-			// dz1 = (dz2 . W2^T) * (1 - h^2)
-			dz1 := make([][]float64, len(x))
-			for i, di := range dz2 {
-				dh := make([]float64, hidden)
-				for j := range dh {
-					for k, g := range di {
-						dh[j] += g * l2.w[j*classes+k]
-					}
-					dh[j] *= 1 - h[i][j]*h[i][j]
-				}
-				dz1[i] = dh
+			for w := 1; w < nw; w++ {
+				grads[0].add(grads[w])
 			}
-
 			t++
-			l2.update(h, dz2, t)
-			l1.update(x, dz1, t)
+			l2.apply(grads[0].w2, grads[0].b2, t)
+			l1.apply(grads[0].w1, grads[0].b1, t)
 		}
 		if epoch%100 == 0 || epoch == epochs {
 			loss, acc := evaluate(l1, l2, trX, trY)
 			fmt.Printf("epoch %4d/%d - loss: %.4f - accuracy: %.4f\n", epoch, epochs, loss, acc)
 		}
 	}
+	quit.Store(true)
+	fmt.Printf("training took %v\n", time.Since(started))
 
 	if err := os.WriteFile(*output, buildTFLite(l1, l2), 0644); err != nil {
 		log.Fatal(err)

@@ -18,7 +18,8 @@ $ go run ./cmd/train
 model: dense(7->64) tanh, dense(64->4) softmax, 772 params
 epoch  100/3600 - loss: 0.9401 - accuracy: 0.5300
 ...
-epoch 3600/3600 - loss: 0.0801 - accuracy: 1.0000
+epoch 3600/3600 - loss: 0.0431 - accuracy: 1.0000
+training took 911.207979ms
 wrote fizzbuzz_model.tflite
 ```
 
@@ -53,6 +54,13 @@ Training has no C dependencies.
 * Adam optimizer (lr=0.001, β1=0.9, β2=0.999, ε=1e-7)
 * categorical crossentropy loss
 * 3600 epochs, batch size 64
+
+The training loop is allocation-free (fused forward/backward per sample on
+stack arrays) and data-parallel: each batch is split across persistent worker
+goroutines with per-worker gradient accumulators. Batches are only ~30µs of
+work, so the workers synchronize by spinning on an atomic sequence number
+(with a `Gosched` fallback) instead of sleeping — futex wake-ups would cost
+more than the work itself.
 
 After training, the weights are serialized into a TensorFlow Lite flatbuffer
 (`FULLY_CONNECTED` → `TANH` → `FULLY_CONNECTED` → `SOFTMAX`) using the
