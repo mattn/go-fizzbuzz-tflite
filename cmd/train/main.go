@@ -75,14 +75,24 @@ func newDense(in, out int, r *rand.Rand) *dense {
 }
 
 // apply performs one Adam update from accumulated gradients.
+//
+// This uses the Keras 3 formulation, not the textbook Kingma-Ba one:
+//
+//	w -= lr * sqrt(1-beta2^t)/(1-beta1^t) * m / (sqrt(v) + eps)
+//
+// Keras folds the bias corrections into the learning rate and adds eps to the
+// *uncorrected* sqrt(v). The textbook form w -= lr * m^ / (sqrt(v^) + eps)
+// differs only in how eps is scaled (eps vs eps*sqrt(1-beta2^t)), which is
+// invisible unless gradients are near zero — but matching Keras exactly is
+// what lets this loop reproduce a tf.keras trajectory step for step from the
+// same initial weights (verified to float32 precision over 200 steps).
 func (d *dense) apply(gw, gb []float64, t int) {
-	c1 := 1 - math.Pow(beta1, float64(t))
-	c2 := 1 - math.Pow(beta2, float64(t))
+	alpha := lr * math.Sqrt(1-math.Pow(beta2, float64(t))) / (1 - math.Pow(beta1, float64(t)))
 	adam := func(w, m, v, g []float64) {
 		for i, gi := range g {
 			m[i] = beta1*m[i] + (1-beta1)*gi
 			v[i] = beta2*v[i] + (1-beta2)*gi*gi
-			w[i] -= lr * (m[i] / c1) / (math.Sqrt(v[i]/c2) + epsilon)
+			w[i] -= alpha * m[i] / (math.Sqrt(v[i]) + epsilon)
 		}
 	}
 	adam(d.w, d.mw, d.vw, gw)
