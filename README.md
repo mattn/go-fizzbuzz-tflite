@@ -41,8 +41,9 @@ Buzz
 
 ## Speed
 
-Compared with the equivalent `tf.keras` script (TensorFlow 2.21, Linux
-x86-64, 16 cores), training the same model for the same 3600 epochs:
+Compared with the equivalent `tf.keras` script
+([`_python/make.py`](_python/make.py), TensorFlow 2.21, Linux x86-64,
+16 cores), training the same model for the same 3600 epochs:
 
 |                        | Python (tf.keras) | Go       |
 |------------------------|-------------------|----------|
@@ -78,6 +79,10 @@ Measuring the cost of one optimizer step (one batch) at each layer:
 XNNPACK only accelerates TFLite *inference*; it plays no part in training,
 which is why inference is fast in both worlds while training speed differs
 by 200x.
+
+All numbers above — and the claim that this loop reproduces a `tf.keras`
+training trajectory to float32 precision — can be reproduced with the
+scripts in [`_python/`](_python/).
 
 ## Requirements
 
