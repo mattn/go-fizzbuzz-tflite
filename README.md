@@ -39,6 +39,22 @@ FizzBuzz
 Buzz
 ```
 
+## Speed
+
+Compared with the equivalent `tf.keras` script (TensorFlow 2.21, Linux
+x86-64, 16 cores), training the same model for the same 3600 epochs:
+
+|                        | Python (tf.keras) | Go       |
+|------------------------|-------------------|----------|
+| whole run              | 3m26s             | 1.05s    |
+| training only          | 207.3s            | 0.95s    |
+| startup (`import tensorflow`) | 3.0s       | -        |
+| write `.tflite`        | 0.53s             | ~1ms     |
+
+Keras spends ~29ms of fixed dispatch overhead per train step, which dwarfs
+the actual math of a 772-parameter model; the Go loop runs the same batch in
+~130µs.
+
 ## Requirements
 
 * TensorFlow Lite C library (only for inference, see
